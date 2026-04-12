@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data (ficheros grandes, no se trackean)
+data/raw/
+data/processed/
+*.csv
+*.parquet
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# MLflow
+mlflow.db
+mlruns/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Plots (regenerables)
+plots/
+
+# Credenciales
+.env
+*.pem
+*.key
+reference/
+
+# Memoria Claude local (no subir al repo)
+.claude/
