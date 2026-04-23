@@ -208,6 +208,16 @@ El mejor umbral en validación es p85 (F0.5=0.683 > 0.669 OCSVM). Sin embargo, a
 - **Normalización**: z-score por segmento antes de extraer ventanas
 - **Umbral**: fijado por percentil sobre errores del train-normal (elegido en val, reportado en test)
 
+> **[2026-04-24] Decisión 10 — Autoencoder temporal → Embedding → LPI (Camino 3):**
+> Features estáticas (catch22, 22 features sobre ventanas de 64 pts) tienen techo supervisado AUC=0.60 en ESA-Mission1 ch14. La señal de anomalía es temporal/secuencial, no capturada por estadísticos de resumen. Solución: Conv1D autoencoder entrenado solo sobre ventanas normales produce embeddings de dimensión 32 que capturan la "esencia" de la secuencia. El LPI opera sobre estos embeddings como detector final. Pipeline completo es unsupervised (labels solo usados para enrichment GMM, no para geometría del AE). Ventanas ampliadas a 256 puntos (~6.4h a 90s/sample) para capturar anomalías de escala horaria.
+>
+> **Arquitectura Conv1D AE (window_size=256):**
+> - Encoder: Conv(1→32,k7,s2) → Conv(32→64,k5,s2) → Conv(64→128,k3,s2) → AdaptiveAvgPool1d(1) → Linear(128, 32)
+> - Decoder: Linear(32, 128) → Upsample(32) → Conv(128,k3) → ConvT(128→64,k3,s2) → ConvT(64→32,k5,s2) → ConvT(32→1,k7,s2)
+> - ~127K params, entrena en <60s RTX A5000, z-score por canal (μ/σ del canal completo)
+>
+> **Scripts:** `prepare_mission1_raw.py` (ventanas crudas) → `src/models/conv_autoencoder.py` → `run_ae_lpi.py` (pipeline completo, reutiliza protocolo de `run_nf_ensemble_s3.py`).
+
 ### Cohort sampling=1 (pendiente, Fase 2)
 
 - `window_size=256`, `stride=128`, mismo modelo con `seq_len=256`
