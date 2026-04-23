@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parents[2]))
 import mlflow
 import numpy as np
 import pandas as pd
+import torch
 from scipy.stats import rankdata
 from sklearn.metrics import fbeta_score, roc_auc_score
 
@@ -192,6 +193,7 @@ def train_single_seed(
     y_train: np.ndarray,
     X_test: np.ndarray,
     y_test: np.ndarray,
+    device: str = "cpu",
 ) -> dict:
     print(f"\n{'─'*60}")
     print(f"Seed {seed}")
@@ -199,7 +201,7 @@ def train_single_seed(
 
     t0 = time.perf_counter()
 
-    detector = LPINormalizingFlow(**NF_PARAMS, random_state=seed)
+    detector = LPINormalizingFlow(**NF_PARAMS, random_state=seed, device=device)
 
     oof_scores = detector.fit_predict_cv(X_train, y_train, cv=CV_FOLDS)
     val_auc = float(roc_auc_score(y_train, oof_scores))
@@ -388,6 +390,11 @@ def bootstrap_ci_metrics(
 
 
 def run(data_path: Path, channel_filter: str | None) -> None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+    if device == "cuda":
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+
     X_train, y_train, X_test, y_test, feature_cols = load_data(data_path, channel_filter)
 
     run_tag = channel_filter or "all_channels"
@@ -427,7 +434,7 @@ def run(data_path: Path, channel_filter: str | None) -> None:
 
         seed_results: list[dict] = []
         for seed in SEEDS:
-            res = train_single_seed(seed, X_train, y_train, X_test, y_test)
+            res = train_single_seed(seed, X_train, y_train, X_test, y_test, device=device)
             seed_results.append(res)
             mlflow.log_metrics(
                 {

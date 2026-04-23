@@ -193,7 +193,7 @@ class _RealNVP(nn.Module):
         z, log_det = self.forward(x)
         log_pz = (
             -0.5 * (z**2).sum(dim=1)
-            - 0.5 * self.d * torch.log(torch.tensor(2.0 * np.pi))
+            - 0.5 * self.d * np.log(2.0 * np.pi)  # Python float — no device issue
         )
         return log_pz + log_det
 
@@ -266,6 +266,7 @@ class LPINormalizingFlow(LPIDetector):
         n_epochs: int = 200,
         flow_lr: float = 1e-3,
         flow_patience: int = 30,
+        device: str = "cpu",
     ) -> None:
         super().__init__(n_components_range, n_bootstrap, scaler, random_state)
         self.n_flow_layers = n_flow_layers
@@ -273,13 +274,15 @@ class LPINormalizingFlow(LPIDetector):
         self.n_epochs = n_epochs
         self.flow_lr = flow_lr
         self.flow_patience = flow_patience
+        self.device = device
         self._flow: Optional[_RealNVP] = None
 
     def _to_latent(self, X_scaled: np.ndarray) -> np.ndarray:
-        X_t = torch.tensor(X_scaled, dtype=torch.float32)
+        dev = torch.device(self.device)
+        X_t = torch.tensor(X_scaled, dtype=torch.float32, device=dev)
         with torch.no_grad():
             Z_t, _ = self._flow(X_t)
-        return Z_t.numpy()
+        return Z_t.cpu().numpy()
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "LPINormalizingFlow":
         if not _TORCH_AVAILABLE:
@@ -292,10 +295,11 @@ class LPINormalizingFlow(LPIDetector):
         X_scaled = self._scaler.fit_transform(X)
 
         # 2. Train RealNVP
+        dev = torch.device(self.device)
         torch.manual_seed(self.random_state)
         n_features = X_scaled.shape[1]
-        self._flow = _RealNVP(n_features, self.n_flow_layers, self.flow_hidden)
-        X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+        self._flow = _RealNVP(n_features, self.n_flow_layers, self.flow_hidden).to(dev)
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32, device=dev)
         self._flow = _train_flow(
             self._flow,
             X_tensor,
@@ -352,6 +356,7 @@ class LPINormalizingFlow(LPIDetector):
             n_epochs=self.n_epochs,
             flow_lr=self.flow_lr,
             flow_patience=self.flow_patience,
+            device=self.device,
         )
 
     def fit_predict_cv(
