@@ -43,9 +43,12 @@ DECISION D — Temporal 80/20 train/test split within Mission1
 DECISION E — Anomaly segment construction
   For each interval [t_start, t_end] in labels.csv:
     • If interval contains ≥ WINDOW_SIZE points:
-        → non-overlapping WINDOW_SIZE windows tiling the interval
-    • If interval contains [MIN_ANOMALY_POINTS, WINDOW_SIZE) points:
+        → non-overlapping WINDOW_SIZE windows tiling the interval (overlap = 100%)
+    • If interval contains [⌈MIN_OVERLAP_FRAC × WINDOW_SIZE⌉, WINDOW_SIZE) points:
         → one window centered on the interval, padded with surrounding context
+           (overlap ≥ MIN_OVERLAP_FRAC → labeled anomalous)
+    • If interval contains [MIN_ANOMALY_POINTS, ⌈MIN_OVERLAP_FRAC × WINDOW_SIZE⌉) points:
+        → DISCARD — overlap < MIN_OVERLAP_FRAC, window is ambiguous (part normal, part anomalous)
     • If interval contains < MIN_ANOMALY_POINTS points:
         → skip (too short for meaningful features)
   Normal windows: sliding window (stride=STRIDE_NORMAL) over the gaps
@@ -120,6 +123,7 @@ WINDOW_SIZE       = 64
 STRIDE_NORMAL     = 32    # stride for normal windows (50% overlap → more diversity)
 MIN_ANOMALY_PTS   = 8     # skip intervals shorter than this
 TRAIN_FRACTION    = 0.80  # temporal split: first 80% of each channel → train
+MIN_OVERLAP_FRAC  = 0.50  # min fraction of a window that must lie inside an anomaly interval
 
 # OPS-SAT-AD feature columns (excluding segment index and meta columns).
 # n_peaks and gaps_squared are computed but flagged for exclusion at train time.
@@ -371,16 +375,28 @@ def extract_anomaly_windows(
     times_s:           np.ndarray,
     values:            np.ndarray,
     anomaly_intervals: list[tuple[float, float]],
-    window_size:       int = WINDOW_SIZE,
-    min_pts:           int = MIN_ANOMALY_PTS,
-) -> list[tuple[np.ndarray, np.ndarray]]:
+    window_size:       int   = WINDOW_SIZE,
+    min_pts:           int   = MIN_ANOMALY_PTS,
+    min_overlap_frac:  float = MIN_OVERLAP_FRAC,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], int]:
     """
     Create fixed-size windows from anomaly intervals.
 
-    Returns list of (window_times_s, window_values) pairs, each exactly
-    window_size points.  All windows carry label=1.
+    A window is labeled anomalous only when the fraction of its points that
+    fall within the anomaly interval is >= min_overlap_frac.  Windows whose
+    overlap is in (0, min_overlap_frac) are discarded as ambiguous — they
+    contain too much normal context to be reliable positive examples.
+
+    For intervals with >= window_size points the overlap is always 100%
+    (the window is fully inside the interval) so min_overlap_frac has no
+    effect on those.
+
+    Returns:
+      windows    — list of (window_times_s, window_values), each window_size pts
+      n_discarded — count of short intervals rejected by the overlap criterion
     """
-    windows: list[tuple[np.ndarray, np.ndarray]] = []
+    windows:     list[tuple[np.ndarray, np.ndarray]] = []
+    n_discarded: int = 0
     n = len(times_s)
 
     for t_start, t_end in anomaly_intervals:
@@ -391,14 +407,22 @@ def extract_anomaly_windows(
             continue
 
         if n_pts >= window_size:
+            # Every point in the tiled window is inside the anomaly interval.
             i = 0
             while i + window_size <= n_pts:
                 seg_idx = idx[i: i + window_size]
                 windows.append((times_s[seg_idx], values[seg_idx]))
                 i += window_size
         else:
-            center = (idx[0] + idx[-1]) // 2
-            half   = window_size // 2
+            # Short interval: the centered window is padded with normal context.
+            # Only keep it if the anomaly fraction meets the threshold.
+            overlap_frac = n_pts / window_size
+            if overlap_frac < min_overlap_frac:
+                n_discarded += 1
+                continue
+
+            center  = (idx[0] + idx[-1]) // 2
+            half    = window_size // 2
             i_start = max(0, center - half)
             i_end   = i_start + window_size
             if i_end > n:
@@ -408,7 +432,7 @@ def extract_anomaly_windows(
                 seg_idx = np.arange(i_start, i_end)
                 windows.append((times_s[seg_idx], values[seg_idx]))
 
-    return windows
+    return windows, n_discarded
 
 
 def extract_normal_windows(
@@ -564,13 +588,14 @@ def assign_train_test(
 # ─── Main pipeline ────────────────────────────────────────────────────────────
 
 def build_dataset(
-    data_dir:       Path,
-    out_dir:        Path,
-    window_size:    int   = WINDOW_SIZE,
-    stride_normal:  int   = STRIDE_NORMAL,
-    min_anom_pts:   int   = MIN_ANOMALY_PTS,
-    train_fraction: float = TRAIN_FRACTION,
-    only_channel:   str | None = None,
+    data_dir:         Path,
+    out_dir:          Path,
+    window_size:      int   = WINDOW_SIZE,
+    stride_normal:    int   = STRIDE_NORMAL,
+    min_anom_pts:     int   = MIN_ANOMALY_PTS,
+    train_fraction:   float = TRAIN_FRACTION,
+    only_channel:     str | None = None,
+    min_overlap_frac: float = MIN_OVERLAP_FRAC,
 ) -> pd.DataFrame:
     """
     Full pipeline: discover channel zips, load labels, segment, featurise, split.
@@ -678,8 +703,8 @@ def build_dataset(
             intervals.append((max(ts, t_min), min(te, t_max)))
 
         # Extract and featurise windows
-        anom_wins = extract_anomaly_windows(
-            times_s, values, intervals, window_size, min_anom_pts
+        anom_wins, n_disc = extract_anomaly_windows(
+            times_s, values, intervals, window_size, min_anom_pts, min_overlap_frac
         )
         norm_wins = extract_normal_windows(
             times_s, values, intervals, window_size, stride_normal
@@ -698,10 +723,12 @@ def build_dataset(
                     **feats,
                 })
 
+        disc_note = f"  discarded={n_disc}" if n_disc else ""
         print(
             f"  [{chan_name:20s}]  {len(times_s):10,} pts | "
             f"dt={dt_s:.0f}s | "
             f"anom_wins={len(anom_wins):4d}  norm_wins={len(norm_wins):5d}"
+            f"{disc_note}"
         )
 
         # Free channel data before loading the next one (Decision F)
@@ -767,11 +794,12 @@ def print_summary(df: pd.DataFrame, out_path: Path) -> str:
 # ─── Channel scan (--scan mode) ───────────────────────────────────────────────
 
 def scan_channels(
-    data_dir:      Path,
-    only_channel:  str | None = None,
-    window_size:   int = WINDOW_SIZE,
-    stride_normal: int = STRIDE_NORMAL,
-    min_anom_pts:  int = MIN_ANOMALY_PTS,
+    data_dir:         Path,
+    only_channel:     str | None = None,
+    window_size:      int   = WINDOW_SIZE,
+    stride_normal:    int   = STRIDE_NORMAL,
+    min_anom_pts:     int   = MIN_ANOMALY_PTS,
+    min_overlap_frac: float = MIN_OVERLAP_FRAC,
 ) -> None:
     """
     Print per-channel anomaly statistics without writing any output files.
@@ -801,10 +829,10 @@ def scan_channels(
     has_abs = not labels_df["start_dt"].isna().all()
 
     W = 22
-    print(f"\n{'Channel':<{W}} {'anom_wins':>9}  {'H1':>5}  {'H2':>5}  {'norm_wins':>9}  {'ratio':>6}")
-    print("─" * 64)
+    print(f"\n{'Channel':<{W}} {'anom_wins':>9}  {'H1':>5}  {'H2':>5}  {'norm_wins':>9}  {'disc':>5}  {'ratio':>6}")
+    print("─" * 70)
 
-    total_anom = total_norm = channels_with_anom = 0
+    total_anom = total_norm = channels_with_anom = total_disc = 0
 
     for ch_path in zip_paths:
         chan_name = ch_path.stem
@@ -837,7 +865,9 @@ def scan_channels(
                 continue
             intervals.append((max(ts, t_min), min(te, t_max)))
 
-        anom_list = extract_anomaly_windows(times_s, values, intervals, window_size, min_anom_pts)
+        anom_list, n_disc = extract_anomaly_windows(
+            times_s, values, intervals, window_size, min_anom_pts, min_overlap_frac
+        )
         norm_list = extract_normal_windows(times_s, values, intervals, window_size, stride_normal)
 
         n_anom = len(anom_list)
@@ -851,11 +881,12 @@ def scan_channels(
         ratio = f"{n_anom / total_ch:.1%}" if total_ch else "    —"
 
         print(
-            f"  {chan_name:<{W - 2}} {n_anom:>9}  {h1:>5}  {h2:>5}  {n_norm:>9}  {ratio:>6}"
+            f"  {chan_name:<{W - 2}} {n_anom:>9}  {h1:>5}  {h2:>5}  {n_norm:>9}  {n_disc:>5}  {ratio:>6}"
         )
 
         total_anom += n_anom
         total_norm += n_norm
+        total_disc += n_disc
         if n_anom > 0:
             channels_with_anom += 1
 
@@ -864,12 +895,13 @@ def scan_channels(
 
     total_wins  = total_anom + total_norm
     global_ratio = f"{total_anom / total_wins:.1%}" if total_wins else "    —"
-    print("─" * 64)
+    print("─" * 70)
     print(
-        f"  {'TOTAL':<{W - 2}} {total_anom:>9}  {'':>5}  {'':>5}  {total_norm:>9}  {global_ratio:>6}"
+        f"  {'TOTAL':<{W - 2}} {total_anom:>9}  {'':>5}  {'':>5}  {total_norm:>9}  {total_disc:>5}  {global_ratio:>6}"
     )
     print(f"\n  Channels scanned        : {len(zip_paths)}")
     print(f"  Channels with anomalies : {channels_with_anom} / {len(zip_paths)}")
+    print(f"  Discarded (ambiguous)   : {total_disc}  (overlap < {min_overlap_frac:.0%})")
     print(f"  Global anomaly ratio    : {global_ratio}")
 
 
@@ -924,17 +956,28 @@ def main() -> None:
         "--train_fraction", type=float, default=TRAIN_FRACTION,
         help=f"Temporal train fraction (default: {TRAIN_FRACTION})",
     )
+    parser.add_argument(
+        "--min-overlap-frac", type=float, default=MIN_OVERLAP_FRAC,
+        dest="min_overlap_frac",
+        help=(
+            f"Min fraction of a window that must lie inside an anomaly interval "
+            f"for the window to be labeled anomalous. Windows with overlap in "
+            f"(0, min-overlap-frac) are discarded as ambiguous. "
+            f"(default: {MIN_OVERLAP_FRAC})"
+        ),
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
 
     if args.scan:
         scan_channels(
-            data_dir      = data_dir,
-            only_channel  = args.channel,
-            window_size   = args.window_size,
-            stride_normal = args.stride_normal,
-            min_anom_pts  = MIN_ANOMALY_PTS,
+            data_dir         = data_dir,
+            only_channel     = args.channel,
+            window_size      = args.window_size,
+            stride_normal    = args.stride_normal,
+            min_anom_pts     = MIN_ANOMALY_PTS,
+            min_overlap_frac = args.min_overlap_frac,
         )
         return
 
@@ -945,20 +988,22 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nESA-AD Mission1 adapter")
-    print(f"  data_dir     : {data_dir}")
-    print(f"  out_dir      : {out_dir}")
-    print(f"  channel      : {args.channel or 'all'}")
-    print(f"  window_size  : {args.window_size}  (~{args.window_size * 90 // 60} min at 90s/sample)")
-    print(f"  stride_normal: {args.stride_normal}")
-    print(f"  train_frac   : {args.train_fraction}")
+    print(f"  data_dir        : {data_dir}")
+    print(f"  out_dir         : {out_dir}")
+    print(f"  channel         : {args.channel or 'all'}")
+    print(f"  window_size     : {args.window_size}  (~{args.window_size * 90 // 60} min at 90s/sample)")
+    print(f"  stride_normal   : {args.stride_normal}")
+    print(f"  train_frac      : {args.train_fraction}")
+    print(f"  min_overlap_frac: {args.min_overlap_frac:.0%}  (short intervals below this are discarded)")
 
     df = build_dataset(
-        data_dir       = data_dir,
-        out_dir        = out_dir,
-        window_size    = args.window_size,
-        stride_normal  = args.stride_normal,
-        train_fraction = args.train_fraction,
-        only_channel   = args.channel,
+        data_dir         = data_dir,
+        out_dir          = out_dir,
+        window_size      = args.window_size,
+        stride_normal    = args.stride_normal,
+        train_fraction   = args.train_fraction,
+        only_channel     = args.channel,
+        min_overlap_frac = args.min_overlap_frac,
     )
 
     out_csv = out_dir / "dataset.csv"
