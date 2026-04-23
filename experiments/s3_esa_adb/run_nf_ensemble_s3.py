@@ -57,8 +57,13 @@ from src.models.lpi_v2 import LPINormalizingFlow
 
 SEEDS = [0, 1, 42, 123, 999]
 
+#  Feature-agnostic loader (S3): the pipeline consumes any set of numeric
+#  columns present in dataset.csv. EXCLUDE_FEATURES is applied only when
+#  those names actually exist — S2 OPS-SAT-AD legacy path — and is a no-op
+#  under the catch22 feature bank. The previous hardcoded
+#  EXPECTED_N_FEATURES=16 guard was an OPS-SAT-AD artifact and has been
+#  removed; the feature count is logged dynamically instead.
 EXCLUDE_FEATURES: set[str] = {"n_peaks", "gaps_squared"}
-EXPECTED_N_FEATURES = 16
 
 CV_FOLDS = 5
 SWEEP_PERCENTILES = [85, 88, 90, 92, 95]
@@ -115,20 +120,22 @@ def load_data(
 
     meta_cols = {"anomaly", "train", "channel", "sampling"}
     feature_cols = [
-        c for c in df.columns if c not in meta_cols and c not in EXCLUDE_FEATURES
+        c for c in df.columns
+        if c not in meta_cols and c not in EXCLUDE_FEATURES
     ]
-
     n_feats = len(feature_cols)
+    excluded_present = sorted(EXCLUDE_FEATURES & set(df.columns))
+
     print(f"\n{'─'*60}")
-    print(f"Feature set: {n_feats} features  (expected {EXPECTED_N_FEATURES})")
-    if n_feats != EXPECTED_N_FEATURES:
-        raise RuntimeError(
-            f"Expected {EXPECTED_N_FEATURES} features, got {n_feats}.\n"
-            f"  Excluded: {sorted(EXCLUDE_FEATURES)}\n"
-            f"  Got: {feature_cols}"
+    print(f"[INFO] Loaded {n_feats} features")
+    print(f"  Columns : {feature_cols}")
+    if excluded_present:
+        print(f"  Dropped : {excluded_present}  (EXCLUDE_FEATURES filter)")
+    else:
+        print(
+            f"  Dropped : none  "
+            f"(EXCLUDE_FEATURES={sorted(EXCLUDE_FEATURES)} not in CSV)"
         )
-    print(f"  Excluded : {sorted(EXCLUDE_FEATURES)}")
-    print(f"  Retained : {feature_cols}")
 
     X_train = df.loc[df["train"] == 1, feature_cols].values.astype(float)
     y_train = df.loc[df["train"] == 1, "anomaly"].values.astype(int)

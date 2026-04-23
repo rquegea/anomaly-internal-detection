@@ -100,20 +100,31 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import io
+import multiprocessing as mp
 import pickle
 import sys
 import textwrap
+import time
 import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import zipfile_deflate64 as zf
 from scipy.signal import find_peaks
 from scipy.stats import kurtosis as sp_kurtosis
 from scipy.stats import skew as sp_skew
+
+# zipfile_deflate64 is only needed by load_channel_zip() — imported lazily so
+# the module is importable for feature-bank inspection / unit tests without it.
+
+try:
+    import pycatch22
+    _CATCH22_AVAILABLE = True
+except ImportError:
+    _CATCH22_AVAILABLE = False
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -125,9 +136,11 @@ MIN_ANOMALY_PTS   = 8     # skip intervals shorter than this
 TRAIN_FRACTION    = 0.80  # temporal split: first 80% of each channel → train
 MIN_OVERLAP_FRAC  = 0.50  # min fraction of a window that must lie inside an anomaly interval
 
-# OPS-SAT-AD feature columns (excluding segment index and meta columns).
+# ─── Feature catalogs ─────────────────────────────────────────────────────────
+
+# Legacy OPS-SAT-AD-compatible features (18). Kept for side-by-side comparison.
 # n_peaks and gaps_squared are computed but flagged for exclusion at train time.
-FEATURE_COLS = [
+LEGACY_FEATURE_COLS = [
     "duration", "len",
     "mean", "var", "std", "kurtosis", "skew",
     "n_peaks",          # ← excluded at training time (length leakage)
@@ -138,6 +151,58 @@ FEATURE_COLS = [
     "len_weighted",
     "var_div_duration", "var_div_len",
 ]
+
+# catch22 (Lubba et al. 2019) — 22 canonical univariate time-series features
+# distilled from hctsa (7700) as the minimum sufficient subset to capture the
+# dynamics of any univariate series, domain-agnostic. pip install pycatch22.
+#
+# Names are probed from pycatch22 itself so that column order always matches
+# the runtime library (the C binding's return order is not alphabetical and
+# can change between versions). The static fallback lists the canonical set
+# for pycatch22 0.4.5 and is only used for CLI / module inspection when the
+# dependency is absent; compute_features_catch22 itself requires pycatch22
+# at call time and will raise otherwise.
+_CATCH22_STATIC_FALLBACK = [
+    "DN_HistogramMode_5", "DN_HistogramMode_10",
+    "CO_f1ecac", "CO_FirstMin_ac",
+    "CO_HistogramAMI_even_2_5", "CO_trev_1_num",
+    "MD_hrv_classic_pnn40",
+    "SB_BinaryStats_mean_longstretch1",
+    "SB_TransitionMatrix_3ac_sumdiagcov",
+    "PD_PeriodicityWang_th0_01",
+    "CO_Embed2_Dist_tau_d_expfit_meandiff",
+    "IN_AutoMutualInfoStats_40_gaussian_fmmi",
+    "FC_LocalSimple_mean1_tauresrat",
+    "DN_OutlierInclude_p_001_mdrmd", "DN_OutlierInclude_n_001_mdrmd",
+    "SP_Summaries_welch_rect_area_5_1",
+    "SB_BinaryStats_diff_longstretch0",
+    "SB_MotifThree_quantile_hh",
+    "SC_FluctAnal_2_rsrangefit_50_1_logi_prop_r1",
+    "SC_FluctAnal_2_dfa_50_1_2_logi_prop_r1",
+    "SP_Summaries_welch_rect_centroid",
+    "FC_LocalSimple_mean3_stderr",
+]
+
+if _CATCH22_AVAILABLE:
+    _probe = pycatch22.catch22_all([0.0] * 64)
+    CATCH22_FEATURE_NAMES = list(_probe["names"])
+    del _probe
+else:
+    CATCH22_FEATURE_NAMES = list(_CATCH22_STATIC_FALLBACK)
+
+assert len(CATCH22_FEATURE_NAMES) == 22, (
+    f"catch22 bank must have 22 features, got {len(CATCH22_FEATURE_NAMES)}"
+)
+CATCH22_COLS = [f"catch22_{n}" for n in CATCH22_FEATURE_NAMES]
+
+
+def _feature_cols(mode: str) -> list[str]:
+    if mode == "legacy":
+        return LEGACY_FEATURE_COLS
+    if mode == "catch22":
+        return CATCH22_COLS
+    raise ValueError(f"Unknown feature mode: {mode!r}")
+
 
 META_COLS = ["anomaly", "train", "channel", "sampling"]
 
@@ -226,6 +291,7 @@ def load_channel_zip(path: Path) -> tuple[np.ndarray, np.ndarray, pd.Timestamp]:
       values  : float64 array, telemetry values
       t0      : pd.Timestamp (UTC-naive, as stored in the pickle DatetimeIndex)
     """
+    import zipfile_deflate64 as zf
     with zf.ZipFile(path) as z:
         data = z.read(z.namelist()[0])
     df = pd.read_pickle(io.BytesIO(data))
@@ -486,7 +552,7 @@ def _smooth(x: np.ndarray, k: int) -> np.ndarray:
     return np.convolve(x, kernel, mode="same")
 
 
-def compute_features(
+def compute_features_legacy(
     window_times_s: np.ndarray,
     window_values:  np.ndarray,
 ) -> dict[str, float]:
@@ -558,6 +624,51 @@ def compute_features(
     }
 
 
+def compute_features_catch22(
+    window_times_s: np.ndarray,
+    window_values:  np.ndarray,
+) -> dict[str, float]:
+    """
+    22 catch22 features (Lubba et al. 2019) — domain-agnostic univariate
+    time-series characteristics. Columns prefixed 'catch22_<canonical_name>'.
+
+    Robustness:
+      • NaN/Inf in the input → replaced with the window's finite median
+        (or 0.0 if the whole window is non-finite). catch22 rejects non-finite
+        values, so this pre-imputation is mandatory.
+      • Constant / zero-variance windows can still yield NaN in some features
+        (autocorrelation-based: CO_FirstMin_ac, CO_f1ecac, etc.). Those are
+        passed through as-is; the LPI loader's train-median imputation step
+        handles them downstream.
+    """
+    v = np.asarray(window_values, dtype=float)
+    finite = np.isfinite(v)
+    if not finite.all():
+        fill = float(np.median(v[finite])) if finite.any() else 0.0
+        v = np.where(finite, v, fill)
+    out = pycatch22.catch22_all(v.tolist())
+    return {f"catch22_{n}": float(x) for n, x in zip(out["names"], out["values"])}
+
+
+def compute_features(
+    window_times_s: np.ndarray,
+    window_values:  np.ndarray,
+    mode:           str = "catch22",
+) -> dict[str, float]:
+    """
+    Dispatcher. mode ∈ {'legacy', 'catch22'}. Default catch22 (universal).
+    """
+    if mode == "legacy":
+        return compute_features_legacy(window_times_s, window_values)
+    if mode == "catch22":
+        if not _CATCH22_AVAILABLE:
+            raise RuntimeError(
+                "pycatch22 is not installed. Run:  pip install pycatch22"
+            )
+        return compute_features_catch22(window_times_s, window_values)
+    raise ValueError(f"Unknown feature mode: {mode!r}")
+
+
 # ─── Train / test split ───────────────────────────────────────────────────────
 
 def assign_train_test(
@@ -585,6 +696,121 @@ def assign_train_test(
     return result
 
 
+# ─── Per-channel worker (module-level so multiprocessing can pickle it) ───────
+
+def _process_channel_worker(
+    args: tuple,
+) -> tuple[str, list[dict], dict]:
+    """
+    Worker: process one channel → (chan_name, rows, stats).
+
+    The worker is pure w.r.t. outer scope: all state comes through `args`.
+    Rows carry no 'segment' column — seg_id is assigned post-hoc so that
+    multiprocessing completion order does not fragment indices.
+
+    Prints one [CHANNEL_DONE] log line on success (grep-friendly).
+    Errors are returned in stats['error'] instead of raising, so a single
+    bad channel does not kill the pool.
+    """
+    ch_path, labels_df, has_abs_timestamps, use_zip, config = args
+    chan_name   = ch_path.stem
+    window_size = config["window_size"]
+    feat_mode   = config["feature_mode"]
+    t_start     = time.perf_counter()
+
+    try:
+        if use_zip:
+            times_s, values, t0 = load_channel_zip(ch_path)
+        else:
+            times_s, values = load_channel_pickle(ch_path)
+            t0 = None
+    except Exception as e:
+        return chan_name, [], {
+            "error": f"load failed: {e}",
+            "runtime": time.perf_counter() - t_start,
+        }
+
+    if len(times_s) < window_size:
+        return chan_name, [], {
+            "error": f"only {len(times_s)} points",
+            "runtime": time.perf_counter() - t_start,
+        }
+
+    dt_s = detect_sampling_rate(times_s)
+
+    # Filter anomaly intervals for this channel (mission-wide ∪ channel-scoped)
+    mask_all  = labels_df["channel"].isna()
+    mask_chan = labels_df["channel"] == chan_name
+    relevant  = labels_df[mask_all | mask_chan]
+
+    t_min, t_max = times_s[0], times_s[-1]
+    intervals: list[tuple[float, float]] = []
+    for _, row in relevant.iterrows():
+        if has_abs_timestamps and t0 is not None and pd.notna(row["start_dt"]):
+            t0_utc = t0.tz_localize("UTC") if t0.tzinfo is None else t0
+            ts = float((row["start_dt"] - t0_utc).total_seconds())
+            te = float((row["end_dt"]   - t0_utc).total_seconds())
+        else:
+            ts, te = float(row["start_s"]), float(row["end_s"])
+        if te < t_min or ts > t_max:
+            continue
+        intervals.append((max(ts, t_min), min(te, t_max)))
+
+    anom_wins, n_disc = extract_anomaly_windows(
+        times_s, values, intervals,
+        window_size, config["min_anom_pts"], config["min_overlap_frac"],
+    )
+    norm_wins = extract_normal_windows(
+        times_s, values, intervals, window_size, config["stride_normal"],
+    )
+
+    rows: list[dict] = []
+    for label, wins in [(1, anom_wins), (0, norm_wins)]:
+        for wt, wv in wins:
+            feats = compute_features(wt, wv, mode=feat_mode)
+            rows.append({
+                "anomaly":  label,
+                "channel":  chan_name,
+                "sampling": round(dt_s),
+                "_t_mid":   float(wt[len(wt) // 2]),
+                **feats,
+            })
+
+    runtime = time.perf_counter() - t_start
+    n_anom  = len(anom_wins)
+    n_norm  = len(norm_wins)
+    total   = n_anom + n_norm
+    ratio   = (n_anom / total) if total else 0.0
+
+    print(
+        f"[CHANNEL_DONE] {chan_name} | n_windows={total} | "
+        f"n_anomaly={n_anom} | ratio={ratio:.3f} | "
+        f"runtime={runtime:.1f}s | features={feat_mode}",
+        flush=True,
+    )
+
+    del times_s, values
+    gc.collect()
+
+    return chan_name, rows, {
+        "n_anom_wins": n_anom,
+        "n_norm_wins": n_norm,
+        "n_disc":      n_disc,
+        "dt_s":        dt_s,
+        "runtime":     runtime,
+    }
+
+
+# ─── md5 helper ───────────────────────────────────────────────────────────────
+
+def _md5_file(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 # ─── Main pipeline ────────────────────────────────────────────────────────────
 
 def build_dataset(
@@ -595,17 +821,24 @@ def build_dataset(
     min_anom_pts:     int   = MIN_ANOMALY_PTS,
     train_fraction:   float = TRAIN_FRACTION,
     only_channel:     str | None = None,
+    only_channels:    list[str] | None = None,
     min_overlap_frac: float = MIN_OVERLAP_FRAC,
+    feature_mode:     str   = "catch22",
+    n_workers:        int   = 1,
 ) -> pd.DataFrame:
     """
-    Full pipeline: discover channel zips, load labels, segment, featurise, split.
+    Full pipeline: discover channels, load labels, segment, featurise, split.
 
-    only_channel: if given (e.g. 'channel_1'), process only that channel.
-                  Useful for quick sanity checks before running all 76 channels.
+    Parameters
+    ----------
+    only_channel  : process only this channel (e.g. 'channel_1'). Legacy flag.
+    only_channels : explicit list of channels; takes priority over only_channel.
+    feature_mode  : 'legacy' (18 OPS-SAT-AD) or 'catch22' (22 universal).
+    n_workers     : parallel channel workers (multiprocessing.Pool). 1 = serial.
 
-    Returns the final DataFrame (also written to out_dir/dataset.csv).
-    Channels are processed sequentially to avoid RAM saturation with 10M+ pt
-    channels (Decision F).
+    Rows are sorted by (channel, _t_mid) before seg_id assignment so the output
+    is byte-identical across runs regardless of n_workers — this makes dataset.md5
+    a reliable idempotency indicator.
     """
     # ── Locate labels ─────────────────────────────────────────────────────────
     labels_candidates = (
@@ -631,7 +864,6 @@ def build_dataset(
         print(f"  Channels    : {len(zip_paths)} channel zips (deflate64)")
         use_zip = True
     else:
-        # Fallback: plain .pkl files (other datasets / older format)
         pkl_paths = sorted(data_dir.glob("*.pkl"))
         if not pkl_paths:
             pkl_paths = sorted(data_dir.rglob("*.pkl"))
@@ -639,12 +871,19 @@ def build_dataset(
             raise FileNotFoundError(
                 f"No channel_*.zip or .pkl files found under {data_dir}"
             )
-        zip_paths = pkl_paths  # reuse variable name for unified loop below
+        zip_paths = pkl_paths
         print(f"  Channels    : {len(zip_paths)} pickle files")
         use_zip = False
 
-    # ── Apply single-channel filter ───────────────────────────────────────────
-    if only_channel:
+    # ── Apply channel filter ──────────────────────────────────────────────────
+    if only_channels:
+        wanted = set(only_channels)
+        zip_paths = [p for p in zip_paths if p.stem in wanted]
+        missing = wanted - {p.stem for p in zip_paths}
+        if missing:
+            raise ValueError(f"--channels not found: {sorted(missing)}")
+        print(f"  Filter      : {len(zip_paths)} channels from --channels list")
+    elif only_channel:
         zip_paths = [p for p in zip_paths if p.stem == only_channel]
         if not zip_paths:
             raise ValueError(
@@ -657,95 +896,75 @@ def build_dataset(
     labels_df = load_labels(labels_path)
     has_abs_timestamps = not labels_df["start_dt"].isna().all()
 
-    # ── Process each channel sequentially ────────────────────────────────────
-    rows: list[dict] = []
-    seg_id = 0
+    # ── Dispatch: serial or parallel ─────────────────────────────────────────
+    config = {
+        "window_size":      window_size,
+        "stride_normal":    stride_normal,
+        "min_anom_pts":     min_anom_pts,
+        "min_overlap_frac": min_overlap_frac,
+        "feature_mode":     feature_mode,
+    }
+    work = [
+        (p, labels_df, has_abs_timestamps, use_zip, config)
+        for p in zip_paths
+    ]
 
-    for ch_path in zip_paths:
-        chan_name = ch_path.stem
+    effective_workers = max(1, min(n_workers, len(work)))
+    print(f"  Workers     : {effective_workers} "
+          f"(requested {n_workers}, {len(work)} channels)")
+    print(f"  Features    : {feature_mode}")
 
-        try:
-            if use_zip:
-                times_s, values, t0 = load_channel_zip(ch_path)
-            else:
-                times_s, values = load_channel_pickle(ch_path)
-                t0 = None
-        except Exception as e:
-            warnings.warn(f"Skipping {chan_name}: {e}")
+    results: list[tuple[str, list[dict], dict]] = []
+    if effective_workers == 1:
+        for w in work:
+            results.append(_process_channel_worker(w))
+    else:
+        with mp.Pool(effective_workers) as pool:
+            for res in pool.imap_unordered(_process_channel_worker, work):
+                results.append(res)
+
+    # ── Collect rows + surface per-channel errors ────────────────────────────
+    all_rows: list[dict] = []
+    ok_channels:    list[str] = []
+    error_channels: list[tuple[str, str]] = []
+    for chan_name, rows, stats in results:
+        if "error" in stats:
+            warnings.warn(f"{chan_name}: {stats['error']}")
+            error_channels.append((chan_name, stats["error"]))
             continue
+        all_rows.extend(rows)
+        ok_channels.append(chan_name)
 
-        if len(times_s) < window_size:
-            warnings.warn(f"Skipping {chan_name}: only {len(times_s)} points")
-            continue
+    print(
+        f"\n  Channels OK : {len(ok_channels)} / {len(zip_paths)}"
+        + (f"  | failed: {[c for c, _ in error_channels]}"
+           if error_channels else "")
+    )
 
-        dt_s = detect_sampling_rate(times_s)
+    if not all_rows:
+        raise RuntimeError("No segments were created. Check data and labels.")
 
-        # Filter anomaly intervals for this channel
-        mask_all  = labels_df["channel"].isna()
-        mask_chan = labels_df["channel"] == chan_name
-        relevant  = labels_df[mask_all | mask_chan]
+    # ── Deterministic order ───────────────────────────────────────────────────
+    # Sort by (channel, _t_mid) so seg_id assignment and CSV row order are
+    # independent of multiprocessing completion order. Stable md5 across runs.
+    all_rows.sort(key=lambda r: (r["channel"], r["_t_mid"]))
 
-        t_min, t_max = times_s[0], times_s[-1]
-        intervals: list[tuple[float, float]] = []
+    # ── Temporal train/test split (per channel, by _t_mid) ───────────────────
+    all_rows = assign_train_test(all_rows, train_fraction)
 
-        for _, row in relevant.iterrows():
-            if has_abs_timestamps and t0 is not None and pd.notna(row["start_dt"]):
-                # Convert absolute label timestamps to seconds relative to channel t0.
-                # t0 from the pickle is tz-naive; labels are UTC — treat as same zone.
-                t0_utc = t0.tz_localize("UTC") if t0.tzinfo is None else t0
-                ts = float((row["start_dt"] - t0_utc).total_seconds())
-                te = float((row["end_dt"]   - t0_utc).total_seconds())
-            else:
-                ts, te = float(row["start_s"]), float(row["end_s"])
+    # Re-sort after the split (assign_train_test re-groups by channel insertion
+    # order, which here matches sorted order; explicit re-sort is defensive).
+    all_rows.sort(key=lambda r: (r["channel"], r["_t_mid"]))
 
-            if te < t_min or ts > t_max:
-                continue
-            intervals.append((max(ts, t_min), min(te, t_max)))
-
-        # Extract and featurise windows
-        anom_wins, n_disc = extract_anomaly_windows(
-            times_s, values, intervals, window_size, min_anom_pts, min_overlap_frac
-        )
-        norm_wins = extract_normal_windows(
-            times_s, values, intervals, window_size, stride_normal
-        )
-
-        for label, wins in [(1, anom_wins), (0, norm_wins)]:
-            for wt, wv in wins:
-                feats = compute_features(wt, wv)
-                seg_id += 1
-                rows.append({
-                    "segment":  seg_id,
-                    "anomaly":  label,
-                    "channel":  chan_name,
-                    "sampling": round(dt_s),
-                    "_t_mid":   float(wt[len(wt) // 2]),
-                    **feats,
-                })
-
-        disc_note = f"  discarded={n_disc}" if n_disc else ""
-        print(
-            f"  [{chan_name:20s}]  {len(times_s):10,} pts | "
-            f"dt={dt_s:.0f}s | "
-            f"anom_wins={len(anom_wins):4d}  norm_wins={len(norm_wins):5d}"
-            f"{disc_note}"
-        )
-
-        # Free channel data before loading the next one (Decision F)
-        del times_s, values
-        gc.collect()
-
-    if not rows:
-        raise RuntimeError("No segments were created. Check data directory and labels.")
-
-    # ── Temporal train/test split ─────────────────────────────────────────────
-    rows = assign_train_test(rows, train_fraction)
+    # ── Post-assign monotonic seg_id ─────────────────────────────────────────
+    for i, r in enumerate(all_rows, start=1):
+        r["segment"] = i
 
     # ── Build DataFrame ───────────────────────────────────────────────────────
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(all_rows)
     df = df.drop(columns=["_t_mid"])
 
-    col_order = ["segment"] + META_COLS + FEATURE_COLS
+    col_order = ["segment"] + META_COLS + _feature_cols(feature_mode)
     df = df[col_order]
     df = df.set_index("segment")
 
@@ -966,7 +1185,37 @@ def main() -> None:
             f"(default: {MIN_OVERLAP_FRAC})"
         ),
     )
+    parser.add_argument(
+        "--features", choices=["legacy", "catch22"], default="catch22",
+        help=(
+            "Feature bank. 'catch22' = 22 canonical domain-agnostic features "
+            "(Lubba 2019, recommended). 'legacy' = 18 OPS-SAT-AD features "
+            "(backward comparison). Default: catch22."
+        ),
+    )
+    parser.add_argument(
+        "--n_workers", type=int, default=1,
+        help=(
+            "Parallel channel workers (multiprocessing.Pool). Each worker loads "
+            "one channel pickle into RAM; 4 workers ≈ 2–4 GB peak. Default: 1 (serial)."
+        ),
+    )
+    parser.add_argument(
+        "--channels", nargs="+", default=None, metavar="CHANNEL_NAME",
+        help=(
+            "Explicit list of channels to process (e.g. --channels channel_14 "
+            "channel_47). Takes priority over --channel. Default: all channels."
+        ),
+    )
     args = parser.parse_args()
+
+    # Early validation: catch22 requires pycatch22
+    if not args.scan and args.features == "catch22" and not _CATCH22_AVAILABLE:
+        parser.error(
+            "pycatch22 is not installed but --features catch22 was requested.\n"
+            "  Install with:  pip install pycatch22\n"
+            "  Or use:        --features legacy"
+        )
 
     data_dir = Path(args.data_dir)
 
@@ -987,10 +1236,16 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    channel_display = (
+        " ".join(args.channels) if args.channels
+        else (args.channel or "all")
+    )
     print(f"\nESA-AD Mission1 adapter")
     print(f"  data_dir        : {data_dir}")
     print(f"  out_dir         : {out_dir}")
-    print(f"  channel         : {args.channel or 'all'}")
+    print(f"  channel         : {channel_display}")
+    print(f"  features        : {args.features}")
+    print(f"  n_workers       : {args.n_workers}")
     print(f"  window_size     : {args.window_size}  (~{args.window_size * 90 // 60} min at 90s/sample)")
     print(f"  stride_normal   : {args.stride_normal}")
     print(f"  train_frac      : {args.train_fraction}")
@@ -1003,12 +1258,20 @@ def main() -> None:
         stride_normal    = args.stride_normal,
         train_fraction   = args.train_fraction,
         only_channel     = args.channel,
+        only_channels    = args.channels,
         min_overlap_frac = args.min_overlap_frac,
+        feature_mode     = args.features,
+        n_workers        = args.n_workers,
     )
 
     out_csv = out_dir / "dataset.csv"
     df.to_csv(out_csv)
     print(f"\n  Wrote {len(df):,} rows → {out_csv}")
+
+    md5 = _md5_file(out_csv)
+    md5_path = out_dir / "dataset.md5"
+    md5_path.write_text(f"{md5}  dataset.csv\n")
+    print(f"  md5   : {md5}  →  {md5_path.name}")
 
     summary = print_summary(df, out_csv)
     (out_dir / "prep_summary.txt").write_text(summary)
