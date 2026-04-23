@@ -133,6 +133,24 @@ def load_data(
     X_test  = df.loc[df["train"] == 0, feature_cols].values.astype(float)
     y_test  = df.loc[df["train"] == 0, "anomaly"].values.astype(int)
 
+    # Replace inf/-inf, then impute NaN with train-column medians (no test leakage)
+    X_train = np.where(np.isinf(X_train), np.nan, X_train)
+    X_test  = np.where(np.isinf(X_test),  np.nan, X_test)
+    nan_counts = np.isnan(X_train).sum(axis=0)
+    if nan_counts.any():
+        print(f"\n  NaN/inf detected — imputing with train median:")
+        for i, (feat, cnt) in enumerate(zip(feature_cols, nan_counts)):
+            if cnt:
+                print(f"    {feat}: {cnt} NaN in train")
+    train_medians = np.nanmedian(X_train, axis=0)
+    for j in range(X_train.shape[1]):
+        mask_tr = np.isnan(X_train[:, j])
+        if mask_tr.any():
+            X_train[mask_tr, j] = train_medians[j]
+        mask_te = np.isnan(X_test[:, j])
+        if mask_te.any():
+            X_test[mask_te, j] = train_medians[j]
+
     sampling_rates = sorted(df["sampling"].unique())
     print(f"  Sampling rates in dataset: {sampling_rates} s")
     print(f"  Train: {len(X_train)} segs  anomaly rate {y_train.mean():.1%}")
