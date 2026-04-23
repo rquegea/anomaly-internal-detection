@@ -267,6 +267,7 @@ class LPINormalizingFlow(LPIDetector):
         flow_lr: float = 1e-3,
         flow_patience: int = 30,
         device: str = "cpu",
+        bic_subsample_size: int = 0,
     ) -> None:
         super().__init__(n_components_range, n_bootstrap, scaler, random_state)
         self.n_flow_layers = n_flow_layers
@@ -275,6 +276,7 @@ class LPINormalizingFlow(LPIDetector):
         self.flow_lr = flow_lr
         self.flow_patience = flow_patience
         self.device = device
+        self.bic_subsample_size = bic_subsample_size
         self._flow: Optional[_RealNVP] = None
 
     def _to_latent(self, X_scaled: np.ndarray) -> np.ndarray:
@@ -311,11 +313,30 @@ class LPINormalizingFlow(LPIDetector):
         # 3. Latent representation
         Z = self._to_latent(X_scaled)
 
-        # 4. BIC K selection in latent space (reuse parent method)
-        self._best_k, mean_bic = self._select_k_by_bic(Z)
+        # 4. BIC K selection in latent space — optionally on a stratified subsample
+        n_total = len(Z)
+        n_bic = self.bic_subsample_size
+        if n_bic > 0 and n_bic < n_total:
+            rng_bic = np.random.RandomState(self.random_state)
+            idx0 = np.where(y == 0)[0]
+            idx1 = np.where(y == 1)[0]
+            n1 = min(len(idx1), max(1, int(n_bic * len(idx1) / n_total)))
+            n0 = min(n_bic - n1, len(idx0))
+            sel = np.concatenate([
+                rng_bic.choice(idx0, size=n0, replace=False),
+                rng_bic.choice(idx1, size=n1, replace=False),
+            ])
+            Z_bic = Z[sel]
+            print(
+                f"[LPINormalizingFlow] BIC subsample: {n_bic}/{n_total} "
+                f"({n0} normal + {n1} anomaly)"
+            )
+        else:
+            Z_bic = Z
+        self._best_k, mean_bic = self._select_k_by_bic(Z_bic)
         print(f"[LPINormalizingFlow] BIC K={self._best_k}  flow_params={self.n_flow_params}")
 
-        # 5. Final GMM on Z
+        # 5. Final GMM on full Z
         self._gmm = GaussianMixture(
             n_components=self._best_k,
             covariance_type="full",
@@ -357,6 +378,7 @@ class LPINormalizingFlow(LPIDetector):
             flow_lr=self.flow_lr,
             flow_patience=self.flow_patience,
             device=self.device,
+            bic_subsample_size=self.bic_subsample_size,
         )
 
     def fit_predict_cv(

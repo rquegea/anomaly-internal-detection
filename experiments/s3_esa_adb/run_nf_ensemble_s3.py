@@ -77,6 +77,7 @@ NF_PARAMS: dict = dict(
     n_epochs=200,
     flow_lr=1e-3,
     flow_patience=30,
+    bic_subsample_size=10_000,
 )
 
 # S2 published baselines for cross-dataset comparison
@@ -423,6 +424,7 @@ def run(data_path: Path, channel_filter: str | None) -> None:
                 "n_flow_layers": NF_PARAMS["n_flow_layers"],
                 "flow_hidden": NF_PARAMS["flow_hidden"],
                 "n_epochs": NF_PARAMS["n_epochs"],
+                "bic_subsample_size": NF_PARAMS["bic_subsample_size"],
                 "bootstrap_n": BOOTSTRAP_N,
             }
         )
