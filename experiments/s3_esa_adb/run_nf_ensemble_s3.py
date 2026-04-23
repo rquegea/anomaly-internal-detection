@@ -195,22 +195,36 @@ def train_single_seed(
     X_test: np.ndarray,
     y_test: np.ndarray,
     device: str = "cpu",
+    nf_params: dict | None = None,
+    cv_folds: int | None = None,
 ) -> dict:
+    if nf_params is None:
+        nf_params = NF_PARAMS
+    if cv_folds is None:
+        cv_folds = CV_FOLDS
+
     print(f"\n{'─'*60}")
     print(f"Seed {seed}")
     print(f"{'─'*60}")
 
     t0 = time.perf_counter()
 
-    detector = LPINormalizingFlow(**NF_PARAMS, random_state=seed, device=device)
+    detector = LPINormalizingFlow(**nf_params, random_state=seed, device=device)
 
-    oof_scores = detector.fit_predict_cv(X_train, y_train, cv=CV_FOLDS)
+    t_cv0 = time.perf_counter()
+    oof_scores = detector.fit_predict_cv(X_train, y_train, cv=cv_folds)
+    t_cv = time.perf_counter() - t_cv0
+
     val_auc = float(roc_auc_score(y_train, oof_scores))
-
     best_p, val_f05, sweep = select_threshold_oof(oof_scores, y_train)
 
+    t_fit0 = time.perf_counter()
     detector.fit(X_train, y_train)
+    t_fit = time.perf_counter() - t_fit0
+
+    t_score0 = time.perf_counter()
     test_scores = detector.score(X_test)
+    t_score = time.perf_counter() - t_score0
 
     oof_thr = float(np.percentile(oof_scores, best_p))
     test_preds = (test_scores >= oof_thr).astype(int)
@@ -227,7 +241,10 @@ def train_single_seed(
         f"  P={met['precision']:.3f}  R={met['recall']:.3f}"
         f"  FP={fp}  FN={fn}"
     )
-    print(f"  Time: {elapsed:.1f}s")
+    print(
+        f"  Phase times:  CV={t_cv:.1f}s  final_fit={t_fit:.1f}s"
+        f"  score={t_score:.3f}s  total={elapsed:.1f}s"
+    )
 
     return {
         "seed": seed,
@@ -390,53 +407,103 @@ def bootstrap_ci_metrics(
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 
-def run(data_path: Path, channel_filter: str | None) -> None:
+def run(data_path: Path, channel_filter: str | None, quick_test: bool = False) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    if device == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    if quick_test:
+        print("\n" + "=" * 60)
+        print("  QUICK TEST MODE  (smoke-test — not for claim)")
+        print("=" * 60)
+        if device == "cuda":
+            print(f"  Device: cuda CONFIRMED — {torch.cuda.get_device_name(0)}")
+        else:
+            print("  Device: cpu  (WARNING: no GPU detected)")
+    else:
+        print(f"Device: {device}")
+        if device == "cuda":
+            print(f"  GPU: {torch.cuda.get_device_name(0)}")
 
     X_train, y_train, X_test, y_test, feature_cols = load_data(data_path, channel_filter)
+
+    # ── Quick-test overrides ──────────────────────────────────────────────────
+    seeds_run = SEEDS
+    cv_folds_run = CV_FOLDS
+    nf_params_run = NF_PARAMS
+    bootstrap_n_run = BOOTSTRAP_N
+
+    if quick_test:
+        QT_TRAIN = 5_000
+        seeds_run = [0]
+        cv_folds_run = 2
+        bootstrap_n_run = 100
+        nf_params_run = {**NF_PARAMS, "n_epochs": 20, "n_bootstrap": 5,
+                         "flow_patience": 10, "bic_subsample_size": 0}
+
+        n_total = len(X_train)
+        rng_qt = np.random.RandomState(0)
+        idx0 = np.where(y_train == 0)[0]
+        idx1 = np.where(y_train == 1)[0]
+        n1 = min(len(idx1), max(1, int(QT_TRAIN * len(idx1) / n_total)))
+        n0 = min(QT_TRAIN - n1, len(idx0))
+        sel = np.concatenate([
+            rng_qt.choice(idx0, size=n0, replace=False),
+            rng_qt.choice(idx1, size=n1, replace=False),
+        ])
+        rng_qt.shuffle(sel)
+        X_train, y_train = X_train[sel], y_train[sel]
+
+        print(f"\n  Train subsample : {len(X_train)} segs"
+              f"  ({n0} normal + {n1} anomaly)")
+        print(f"  Seeds           : {seeds_run}")
+        print(f"  CV folds        : {cv_folds_run}")
+        print(f"  n_epochs        : {nf_params_run['n_epochs']}")
+        print(f"  n_bootstrap BIC : {nf_params_run['n_bootstrap']}")
+        print("=" * 60)
 
     run_tag = channel_filter or "all_channels"
     print(f"\n{'='*60}")
     print(f"LPINormalizingFlow Seed Ensemble — S3 ESA-Mission1  ({run_tag})")
     print(f"{'='*60}")
-    print(f"Seeds: {SEEDS}")
-    print(f"NF config: {NF_PARAMS}")
+    print(f"Seeds: {seeds_run}")
+    print(f"NF config: {nf_params_run}")
 
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
+    run_name = f"quick_test_{run_tag}" if quick_test else f"nf_ensemble_{run_tag}"
 
-    with mlflow.start_run(run_name=f"nf_ensemble_{run_tag}"):
+    with mlflow.start_run(run_name=run_name):
         mlflow.log_params(
             {
-                "seeds": str(SEEDS),
+                "seeds": str(seeds_run),
                 "channel": run_tag,
                 "data_path": str(data_path),
                 "sampling_filter": "none (ESA-M1 ~90s/sample)",
+                "quick_test": quick_test,
                 "n_train": len(X_train),
                 "n_test": len(X_test),
                 "anomaly_rate_train": f"{y_train.mean():.3f}",
                 "anomaly_rate_test": f"{y_test.mean():.3f}",
                 "n_features": len(feature_cols),
                 "excluded_features": str(sorted(EXCLUDE_FEATURES)),
-                "cv_folds": CV_FOLDS,
-                "n_flow_layers": NF_PARAMS["n_flow_layers"],
-                "flow_hidden": NF_PARAMS["flow_hidden"],
-                "n_epochs": NF_PARAMS["n_epochs"],
-                "bic_subsample_size": NF_PARAMS["bic_subsample_size"],
-                "bootstrap_n": BOOTSTRAP_N,
+                "cv_folds": cv_folds_run,
+                "n_flow_layers": nf_params_run["n_flow_layers"],
+                "flow_hidden": nf_params_run["flow_hidden"],
+                "n_epochs": nf_params_run["n_epochs"],
+                "bic_subsample_size": nf_params_run["bic_subsample_size"],
+                "bootstrap_n": bootstrap_n_run,
             }
         )
 
         # ── Step 1: Train all seeds ───────────────────────────────────────────
+        t_total0 = time.perf_counter()
         print(f"\n{'='*60}")
         print("STEP 1 — Individual seed training")
         print(f"{'='*60}")
 
         seed_results: list[dict] = []
-        for seed in SEEDS:
-            res = train_single_seed(seed, X_train, y_train, X_test, y_test, device=device)
+        for seed in seeds_run:
+            res = train_single_seed(
+                seed, X_train, y_train, X_test, y_test,
+                device=device, nf_params=nf_params_run, cv_folds=cv_folds_run,
+            )
             seed_results.append(res)
             mlflow.log_metrics(
                 {
@@ -473,7 +540,7 @@ def run(data_path: Path, channel_filter: str | None) -> None:
 
         # ── Step 3: Bootstrap CI ──────────────────────────────────────────────
         print(f"\n{'='*60}")
-        print(f"STEP 3 — Bootstrap CI95  (B={BOOTSTRAP_N})")
+        print(f"STEP 3 — Bootstrap CI95  (B={bootstrap_n_run})")
         print(f"{'='*60}")
 
         ci_results: dict[str, dict] = {}
@@ -481,7 +548,7 @@ def run(data_path: Path, channel_filter: str | None) -> None:
             print(f"\n  {name} ensemble ...")
             ci = bootstrap_ci_metrics(
                 strat["ens_test"], y_test, strat["threshold"],
-                n_bootstrap=BOOTSTRAP_N, seed=BOOTSTRAP_MASTER_SEED,
+                n_bootstrap=bootstrap_n_run, seed=BOOTSTRAP_MASTER_SEED,
             )
             ci_results[name] = ci
             print(
@@ -619,6 +686,19 @@ def run(data_path: Path, channel_filter: str | None) -> None:
     else:
         print("  ✗ S3 F0.5 degraded by >0.15 — generalization NOT supported for this channel")
 
+    if quick_test:
+        t_total = time.perf_counter() - t_total0
+        print(f"\n{'='*60}")
+        print("QUICK TEST SUMMARY")
+        print(f"{'='*60}")
+        print(f"  Total wall time : {t_total:.1f}s")
+        print(f"  Device          : {device}")
+        print(f"  Train size      : {len(X_train)} segs")
+        print(f"  Test  F0.5      : {seed_results[0]['test_f05']:.3f}"
+              f"  AUC={seed_results[0]['test_auc']:.3f}  (smoke-test only)")
+        print(f"\n  Pipeline OK — ready for full run.")
+        return
+
     # ── Final claim line ──────────────────────────────────────────────────────
     ci_lower = winner_ci["f05_ci_lower"]
     print(f"\n{'='*60}")
@@ -644,9 +724,16 @@ def main() -> None:
         "--channel", default=None, metavar="CHANNEL_NAME",
         help="Restrict to a single channel (e.g. 'channel_47'). Default: all channels.",
     )
+    parser.add_argument(
+        "--quick-test", action="store_true",
+        help=(
+            "Smoke-test mode: 5k stratified train, 1 seed, 2 CV folds, 20 epochs. "
+            "Validates GPU pipeline end-to-end in <5 min. Results are NOT for claim."
+        ),
+    )
     args = parser.parse_args()
 
-    run(Path(args.data_path), args.channel)
+    run(Path(args.data_path), args.channel, quick_test=args.quick_test)
 
 
 if __name__ == "__main__":
