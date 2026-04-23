@@ -764,12 +764,126 @@ def print_summary(df: pd.DataFrame, out_path: Path) -> str:
     return summary
 
 
+# ─── Channel scan (--scan mode) ───────────────────────────────────────────────
+
+def scan_channels(
+    data_dir:      Path,
+    only_channel:  str | None = None,
+    window_size:   int = WINDOW_SIZE,
+    stride_normal: int = STRIDE_NORMAL,
+    min_anom_pts:  int = MIN_ANOMALY_PTS,
+) -> None:
+    """
+    Print per-channel anomaly statistics without writing any output files.
+
+    For each channel reports:
+      anom_wins  — total anomalous windows extracted
+      H1 / H2    — anom_wins in first vs second temporal half of the channel
+      norm_wins  — total normal windows extracted
+      ratio      — anom_wins / (anom_wins + norm_wins)
+    """
+    channels_dir = data_dir / "channels"
+    zip_paths = sorted(
+        channels_dir.glob("channel_*.zip") if channels_dir.is_dir()
+        else data_dir.glob("channel_*.zip")
+    )
+    if not zip_paths:
+        raise FileNotFoundError(f"No channel_*.zip found under {data_dir}")
+    if only_channel:
+        zip_paths = [p for p in zip_paths if p.stem == only_channel]
+
+    labels_candidates = (
+        list(data_dir.glob("labels*.csv")) + list(data_dir.glob("Labels*.csv"))
+    )
+    if not labels_candidates:
+        raise FileNotFoundError(f"No labels*.csv found in {data_dir}")
+    labels_df = load_labels(labels_candidates[0])
+    has_abs = not labels_df["start_dt"].isna().all()
+
+    W = 22
+    print(f"\n{'Channel':<{W}} {'anom_wins':>9}  {'H1':>5}  {'H2':>5}  {'norm_wins':>9}  {'ratio':>6}")
+    print("─" * 64)
+
+    total_anom = total_norm = channels_with_anom = 0
+
+    for ch_path in zip_paths:
+        chan_name = ch_path.stem
+        try:
+            times_s, values, t0 = load_channel_zip(ch_path)
+        except Exception as e:
+            print(f"  {chan_name:<{W - 2}}  ERROR: {e}")
+            continue
+
+        if len(times_s) < window_size:
+            print(f"  {chan_name:<{W - 2}}  SKIP ({len(times_s)} pts < window_size)")
+            del times_s, values
+            gc.collect()
+            continue
+
+        mask_all  = labels_df["channel"].isna()
+        mask_chan = labels_df["channel"] == chan_name
+        relevant  = labels_df[mask_all | mask_chan]
+
+        t_min, t_max = times_s[0], times_s[-1]
+        intervals: list[tuple[float, float]] = []
+        for _, row in relevant.iterrows():
+            if has_abs and pd.notna(row["start_dt"]):
+                t0_utc = t0.tz_localize("UTC") if t0.tzinfo is None else t0
+                ts = float((row["start_dt"] - t0_utc).total_seconds())
+                te = float((row["end_dt"]   - t0_utc).total_seconds())
+            else:
+                ts, te = float(row["start_s"]), float(row["end_s"])
+            if te < t_min or ts > t_max:
+                continue
+            intervals.append((max(ts, t_min), min(te, t_max)))
+
+        anom_list = extract_anomaly_windows(times_s, values, intervals, window_size, min_anom_pts)
+        norm_list = extract_normal_windows(times_s, values, intervals, window_size, stride_normal)
+
+        n_anom = len(anom_list)
+        n_norm = len(norm_list)
+
+        t_mid_ch = (t_min + t_max) / 2
+        h1 = sum(1 for wt, _ in anom_list if wt[len(wt) // 2] < t_mid_ch)
+        h2 = n_anom - h1
+
+        total_ch = n_anom + n_norm
+        ratio = f"{n_anom / total_ch:.1%}" if total_ch else "    —"
+
+        print(
+            f"  {chan_name:<{W - 2}} {n_anom:>9}  {h1:>5}  {h2:>5}  {n_norm:>9}  {ratio:>6}"
+        )
+
+        total_anom += n_anom
+        total_norm += n_norm
+        if n_anom > 0:
+            channels_with_anom += 1
+
+        del times_s, values
+        gc.collect()
+
+    total_wins  = total_anom + total_norm
+    global_ratio = f"{total_anom / total_wins:.1%}" if total_wins else "    —"
+    print("─" * 64)
+    print(
+        f"  {'TOTAL':<{W - 2}} {total_anom:>9}  {'':>5}  {'':>5}  {total_norm:>9}  {global_ratio:>6}"
+    )
+    print(f"\n  Channels scanned        : {len(zip_paths)}")
+    print(f"  Channels with anomalies : {channels_with_anom} / {len(zip_paths)}")
+    print(f"  Global anomaly ratio    : {global_ratio}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Prepare ESA-Mission1 → dataset.csv for LPI pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
             Examples:
+              # Scan all channels — anomaly stats, no CSV output:
+              python experiments/s3_esa_adb/prepare_mission1.py \\
+                  --data_dir /workspace/ESA-Mission1/ESA-Mission1 \\
+                  --scan
+
               # Full run (all 76 channels — ~hours):
               python experiments/s3_esa_adb/prepare_mission1.py \\
                   --data_dir /workspace/ESA-Mission1/ESA-Mission1 \\
@@ -787,8 +901,12 @@ def main() -> None:
         help="Path to ESA-Mission1 directory (with labels.csv and channels/ subdir)",
     )
     parser.add_argument(
-        "--out_dir",  required=True,
-        help="Output directory for dataset.csv",
+        "--out_dir", default=None,
+        help="Output directory for dataset.csv (required unless --scan is used)",
+    )
+    parser.add_argument(
+        "--scan", action="store_true",
+        help="Print per-channel anomaly stats without writing any CSV. Ignores --out_dir.",
     )
     parser.add_argument(
         "--channel", default=None, metavar="CHANNEL_NAME",
@@ -809,7 +927,21 @@ def main() -> None:
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
-    out_dir  = Path(args.out_dir)
+
+    if args.scan:
+        scan_channels(
+            data_dir      = data_dir,
+            only_channel  = args.channel,
+            window_size   = args.window_size,
+            stride_normal = args.stride_normal,
+            min_anom_pts  = MIN_ANOMALY_PTS,
+        )
+        return
+
+    if args.out_dir is None:
+        parser.error("--out_dir is required unless --scan is used")
+
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nESA-AD Mission1 adapter")
