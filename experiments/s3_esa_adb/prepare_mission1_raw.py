@@ -11,10 +11,11 @@ Output (in --out_dir):
   config.json   — window_size, stride_normal, channels, etc.
 
 Design differences from prepare_mission1.py:
-  • Per-channel z-score: μ/σ computed on the full channel signal before
-    windowing (1-pass). This preserves absolute-level information — a
-    potential anomaly signal — while bringing all channels to the same scale.
-    A constant channel (σ < 1e-8) is left as-is (zeros after centring).
+  • Rolling z-score: each point normalised by the mean/std of a centred
+    context window (--context, default 2048 pts ≈ 51 h at 90 s/sample).
+    Eliminates temporal drift while preserving local deviations.
+    Replaces the previous global z-score which failed on channels with
+    severe drift (e.g. channel_14 mean drift range ≈ 0.73 across blocks).
   • Output is raw windows, not feature vectors. window_size=256 default
     (vs 64 in prepare_mission1.py) to capture longer temporal structures.
   • Multiprocessing: same mp.Pool pattern as prepare_mission1.py.
@@ -74,6 +75,26 @@ from experiments.s3_esa_adb.prepare_mission1 import (
 
 WINDOW_SIZE    = 256   # ~6.4 h at 90 s/sample (ESA-Mission1 nominal)
 STRIDE_RAW     = 128   # 50 % overlap for normal windows
+CONTEXT_POINTS = 2048  # rolling z-score window (~51 h at 90 s/sample)
+
+
+def rolling_zscore(values: np.ndarray, context: int = CONTEXT_POINTS) -> np.ndarray:
+    """Rolling z-score using cumulative sums. O(n) time, no Python loop."""
+    n = len(values)
+    half = context // 2
+
+    padded  = np.pad(values, half, mode='edge')
+    cumsum  = np.concatenate([[0.0], np.cumsum(padded)])
+    cumsum2 = np.concatenate([[0.0], np.cumsum(padded ** 2)])
+
+    lo     = np.arange(n)
+    hi     = lo + context
+    counts = hi - lo
+    local_mean = (cumsum[hi] - cumsum[lo]) / counts
+    local_var  = (cumsum2[hi] - cumsum2[lo]) / counts - local_mean ** 2
+    local_std  = np.sqrt(np.maximum(local_var, 1e-12))
+
+    return (values - local_mean) / local_std
 
 
 # ─── Per-channel worker (module-level for mp.Pool pickling) ───────────────────
@@ -113,12 +134,8 @@ def _process_channel_raw(
         return chan_name, [], {"error": f"only {len(times_s)} points",
                                "runtime": time.perf_counter() - t_start}
 
-    # ── Per-channel z-score (full signal, 1-pass) ─────────────────────────────
-    mu    = float(np.nanmean(values))
-    sigma = float(np.nanstd(values))
-    if sigma < 1e-8:
-        sigma = 1.0   # constant channel: centre only, no scaling
-    values_norm = ((values - mu) / sigma).astype(np.float32)
+    # ── Rolling z-score (eliminates temporal drift) ───────────────────────────
+    values_norm = rolling_zscore(values, config["context"]).astype(np.float32)
 
     dt_s = detect_sampling_rate(times_s)
 
@@ -198,6 +215,7 @@ def build_raw_dataset(
     only_channels:    list[str] | None = None,
     min_overlap_frac: float = MIN_OVERLAP_FRAC,
     n_workers:        int   = 1,
+    context:          int   = CONTEXT_POINTS,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """
     Full pipeline: discover channels → load → z-score → window → split.
@@ -261,6 +279,7 @@ def build_raw_dataset(
         "window_size":      window_size,
         "stride_normal":    stride_normal,
         "min_overlap_frac": min_overlap_frac,
+        "context":          context,
     }
     work = [
         (p, labels_df, has_abs_timestamps, use_zip, config)
@@ -421,6 +440,8 @@ def main() -> None:
                         help=f"Min anomaly overlap fraction (default: {MIN_OVERLAP_FRAC})")
     parser.add_argument("--n_workers", type=int, default=1,
                         help="Parallel channel workers (default: 1 = serial)")
+    parser.add_argument("--context", type=int, default=CONTEXT_POINTS,
+                        help=f"Rolling z-score window in points (default: {CONTEXT_POINTS} ≈ 51h at 90s/sample)")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -440,6 +461,7 @@ def main() -> None:
     print(f"  stride_normal   : {args.stride_normal}")
     print(f"  train_fraction  : {args.train_fraction}")
     print(f"  min_overlap_frac: {args.min_overlap_frac:.0%}")
+    print(f"  context         : {args.context} pts (~{args.context * 90 // 3600}h at 90s/sample)")
 
     windows, meta_df = build_raw_dataset(
         data_dir         = data_dir,
@@ -451,6 +473,7 @@ def main() -> None:
         only_channels    = args.channels,
         min_overlap_frac = args.min_overlap_frac,
         n_workers        = args.n_workers,
+        context          = args.context,
     )
 
     # ── Save windows.npy ──────────────────────────────────────────────────────
@@ -470,10 +493,11 @@ def main() -> None:
         "stride_normal":     args.stride_normal,
         "train_fraction":    args.train_fraction,
         "min_overlap_frac":  args.min_overlap_frac,
+        "context":           args.context,
         "n_windows":         int(len(meta_df)),
         "n_channels":        int(meta_df["channel"].nunique()),
         "channels":          channels_processed,
-        "normalization":     "z-score per channel (full signal mu/sigma)",
+        "normalization":     f"rolling z-score per channel (context={args.context} pts)",
     }
     config_path = out_dir / "config.json"
     with open(config_path, "w") as f:
