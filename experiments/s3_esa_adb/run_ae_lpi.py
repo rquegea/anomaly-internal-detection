@@ -41,6 +41,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 
+# Force line-buffered output so nohup logs appear in real time
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import mlflow
 import numpy as np
 import pandas as pd
@@ -240,6 +244,7 @@ def run(
     ae_lr:          float = AE_DEFAULTS["ae_lr"],
     ae_batch_size:  int  = AE_DEFAULTS["ae_batch_size"],
     ae_patience:    int  = AE_DEFAULTS["ae_patience"],
+    bic_subsample:  int  = 10_000,
 ) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     run_tag = channel_filter or "all_channels"
@@ -279,7 +284,7 @@ def run(
     # ── Quick-test overrides ──────────────────────────────────────────────────
     seeds_run      = SEEDS
     cv_folds_run   = CV_FOLDS
-    nf_params_run  = NF_PARAMS
+    nf_params_run  = {**NF_PARAMS, "bic_subsample_size": bic_subsample}
     bootstrap_n    = BOOTSTRAP_N
     ae_epochs_run  = ae_epochs
 
@@ -640,6 +645,11 @@ def main() -> None:
         "--quick-test", action="store_true",
         help="Smoke-test: 2k AE windows, 10 AE epochs, 1 seed, 2-fold CV. Not for claim.",
     )
+    parser.add_argument(
+        "--bic_subsample", type=int, default=10_000,
+        help="Max samples used for BIC selection in LPINormalizingFlow (0 = all). "
+             "Default 10000 gives same K as full-data but ~3× faster.",
+    )
     args = parser.parse_args()
 
     run(
@@ -652,6 +662,7 @@ def main() -> None:
         ae_lr          = args.ae_lr,
         ae_batch_size  = args.ae_batch_size,
         ae_patience    = args.ae_patience,
+        bic_subsample  = args.bic_subsample,
     )
 
 
