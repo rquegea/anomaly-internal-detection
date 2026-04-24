@@ -37,6 +37,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
@@ -253,7 +254,7 @@ def train_single_seed(
         f"  score={t_score:.3f}s  total={elapsed:.1f}s"
     )
 
-    return {
+    result = {
         "seed": seed,
         "oof_scores": oof_scores,
         "test_scores": test_scores,
@@ -266,6 +267,15 @@ def train_single_seed(
         "test_recall": met["recall"],
         "elapsed": elapsed,
     }
+
+    # Free per-seed model state (RealNVP + GMM hold MB-scale tensors that
+    # otherwise accumulate across seeds × folds in the outer orchestrator).
+    del detector
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
 
 
 # ─── Normalisation helpers ────────────────────────────────────────────────────

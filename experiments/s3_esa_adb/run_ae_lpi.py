@@ -35,6 +35,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
@@ -60,6 +61,8 @@ from src.models.conv_autoencoder import (
     train_autoencoder,
 )
 from src.models.lpi_v2 import LPINormalizingFlow
+
+from experiments.s3_esa_adb._mem_monitor import Timer, log_mem
 
 # Reuse ensemble-building utilities from the S3 NF pipeline (no duplication)
 from experiments.s3_esa_adb.run_nf_ensemble_s3 import (
@@ -244,23 +247,32 @@ def run(
     ae_lr:          float = AE_DEFAULTS["ae_lr"],
     ae_batch_size:  int  = AE_DEFAULTS["ae_batch_size"],
     ae_patience:    int  = AE_DEFAULTS["ae_patience"],
-    bic_subsample:  int  = 10_000,
+    bic_subsample:  int  = 3_000,
+    force_cpu:      bool = False,
 ) -> None:
+    log_mem("startup")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device != "cuda" and not force_cpu:
+        raise RuntimeError(
+            "GPU requerida para este run (torch.cuda.is_available() == False). "
+            "Verifica la instalación de CUDA o usa --force_cpu si realmente quieres CPU."
+        )
+    if device == "cuda":
+        print(
+            f"[GPU] Usando {torch.cuda.get_device_name(0)}  "
+            f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB VRAM)"
+        )
+    else:
+        print("[GPU] --force_cpu activo — corriendo en CPU.")
+
     run_tag = channel_filter or "all_channels"
 
     if quick_test:
         print("\n" + "=" * 60)
         print("  QUICK TEST MODE  (smoke-test — not for claim)")
         print("=" * 60)
-        if device == "cuda":
-            print(f"  Device: cuda — {torch.cuda.get_device_name(0)}")
-        else:
-            print("  Device: cpu")
-    else:
-        print(f"Device: {device}")
-        if device == "cuda":
-            print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  Device: {device}")
 
     # ── Step 0: Load raw windows ──────────────────────────────────────────────
     (
@@ -294,7 +306,7 @@ def run(
         bootstrap_n   = 100
         ae_epochs_run = 10
         nf_params_run = {**NF_PARAMS, "n_epochs": 10, "n_bootstrap": 3,
-                         "flow_patience": 5, "bic_subsample_size": 0}
+                         "flow_patience": 5, "bic_subsample_size": bic_subsample}
 
         # Subsample train_normal for AE (keep anomaly rate roughly intact)
         QT_AE = min(2_000, len(windows_train_normal))
@@ -352,6 +364,16 @@ def run(
           f"({emb_train.shape[0]:,} × {emb_train.shape[1]})")
     print(f"  Test  embeddings : {emb_test.shape}")
     print(f"  Extraction time  : {t_emb:.1f}s")
+
+    # AE is no longer needed after embeddings exist — free its parameters
+    # (and any cuBLAS workspace) before Step 5 starts allocating GMM/flow
+    # tensors per seed.
+    model = model.cpu()
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[MEM] Autoencoder liberado de GPU")
 
     # ── Step 3: Save dataset_embeddings.csv ───────────────────────────────────
     print(f"\n{'='*60}")
@@ -428,6 +450,7 @@ def run(
             "n_flow_layers":   nf_params_run["n_flow_layers"],
             "flow_hidden":     nf_params_run["flow_hidden"],
             "n_epochs_lpi":    nf_params_run["n_epochs"],
+            "bic_subsample_size": nf_params_run["bic_subsample_size"],
         })
         mlflow.log_metrics({
             "rf_auc": rf_metrics["rf_auc"],
@@ -439,20 +462,32 @@ def run(
         print(f"\n{'='*60}")
         print("STEP 5a — Individual seed training")
         print(f"{'='*60}")
+        log_mem("step5_start")
 
         seed_results: list[dict] = []
         for seed in seeds_run:
-            res = train_single_seed(
-                seed, emb_train, y_train, emb_test, y_test,
-                device=device, nf_params=nf_params_run, cv_folds=cv_folds_run,
-            )
-            seed_results.append(res)
-            mlflow.log_metrics({
-                f"seed{seed}_val_auc":  res["val_auc"],
-                f"seed{seed}_val_f05":  res["val_f05"],
-                f"seed{seed}_test_f05": res["test_f05"],
-                f"seed{seed}_test_auc": res["test_auc"],
-            })
+            log_mem(f"before_seed_{seed}")
+            with Timer(f"seed_{seed}"):
+                res = train_single_seed(
+                    seed, emb_train, y_train, emb_test, y_test,
+                    device=device, nf_params=nf_params_run, cv_folds=cv_folds_run,
+                )
+                seed_results.append(res)
+                mlflow.log_metrics({
+                    f"seed{seed}_val_auc":  res["val_auc"],
+                    f"seed{seed}_val_f05":  res["val_f05"],
+                    f"seed{seed}_test_f05": res["test_f05"],
+                    f"seed{seed}_test_auc": res["test_auc"],
+                })
+            # Belt-and-braces: train_single_seed already releases the detector,
+            # but the orchestrator-level seed-loop locals (intermediate refs in
+            # MLflow logging, timing) still benefit from a sweep here.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            log_mem(f"after_seed_{seed}")
+
+        log_mem("step5_end")
 
         # ── Ensembles ──────────────────────────────────────────────────────────
         print(f"\n{'='*60}")
@@ -642,15 +677,24 @@ def main() -> None:
     parser.add_argument("--ae_batch_size",  type=int,   default=AE_DEFAULTS["ae_batch_size"])
     parser.add_argument("--ae_patience",    type=int,   default=AE_DEFAULTS["ae_patience"])
     parser.add_argument(
-        "--quick-test", action="store_true",
+        "--quick-test", "--quick_test", action="store_true", dest="quick_test",
         help="Smoke-test: 2k AE windows, 10 AE epochs, 1 seed, 2-fold CV. Not for claim.",
     )
     parser.add_argument(
-        "--bic_subsample", type=int, default=10_000,
-        help="Max samples used for BIC selection in LPINormalizingFlow (0 = all). "
-             "Default 10000 gives same K as full-data but ~3× faster.",
+        "--bic_subsample", type=int, default=None,
+        help="Tamaño de muestra para BIC en LPINormalizingFlow "
+             "(0 = all data). Default: 3000 en full run, 0 en quick_test.",
+    )
+    parser.add_argument(
+        "--force_cpu", action="store_true",
+        help="Permitir ejecución en CPU (por defecto falla si no hay GPU).",
     )
     args = parser.parse_args()
+
+    if args.bic_subsample is not None:
+        bic_subsample = args.bic_subsample
+    else:
+        bic_subsample = 0 if args.quick_test else 3_000
 
     run(
         raw_dir        = Path(args.raw_dir),
@@ -662,7 +706,8 @@ def main() -> None:
         ae_lr          = args.ae_lr,
         ae_batch_size  = args.ae_batch_size,
         ae_patience    = args.ae_patience,
-        bic_subsample  = args.bic_subsample,
+        bic_subsample  = bic_subsample,
+        force_cpu      = args.force_cpu,
     )
 
 
